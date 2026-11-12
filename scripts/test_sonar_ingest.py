@@ -233,5 +233,121 @@ class IntakeTests(unittest.TestCase):
                 pass
 
 
+class V2IntakeTests(unittest.TestCase):
+    """Формат OpenCode 2: session_v2 + session_message, tool-части внутри content."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.db = sqlite3.connect(self.root / 'opencode.db')
+        self.addCleanup(self.db.close)
+        self.db.executescript('''
+            CREATE TABLE session_v2(id TEXT, directory TEXT);
+            CREATE TABLE session_message(id TEXT, session_id TEXT, type TEXT,
+                seq INTEGER, time_created INT, time_updated INT, data TEXT);
+            INSERT INTO session_v2 VALUES('current','project'),('other','project');
+        ''')
+        self.number = 0
+        self.reports = self.root / 'reports'
+        for target in ('socket.socket', 'socket.create_connection', 'urllib.request.urlopen', 'subprocess.Popen'):
+            guard = patch(target, side_effect=AssertionError('Сеть и внешние программы запрещены'))
+            guard.start()
+            self.addCleanup(guard.stop)
+        self.add('user', '# Sonar: разбор замечаний по модулям\nПример: {"issues": []}')
+        self.add('user', URL)
+        self.handoff()
+
+    def add(self, role, text=None, part=None, session='current', status='completed'):
+        self.number += 1
+        mid = 'message-' + str(self.number).zfill(4)
+        if role == 'assistant':
+            data = {'agent': 'build', 'model': 'demo', 'finish': 'tool-calls',
+                    'content': [part or {'type': 'text', 'text': ''}]}
+            kind = 'assistant'
+        else:
+            data = {'text': text, 'time': self.number}
+            kind = 'user'
+        payload = part or {}
+        if role == 'assistant' and payload.get('type') == 'tool':
+            payload = dict(payload)
+            state = dict(payload.get('state') or {})
+            state['status'] = status
+            payload['state'] = state
+            data['content'] = [payload]
+        self.db.execute('INSERT INTO session_message VALUES(?,?,?,?,?,?,?)',
+                        (mid, session, kind, self.number, self.number, self.number,
+                         json.dumps(data, ensure_ascii=False)))
+        self.db.commit()
+        return mid
+
+    def handoff(self):
+        self.add('assistant', part={'type': 'tool', 'id': 'tool-api', 'name': 'bash',
+                 'state': {'input': {'command': 'python scripts/sonar_index.py api-url "' + URL + '"'},
+                           'content': api_url(URL) + '\nWAITING_FOR_USER_JSON\n'}})
+
+    def run_ingest(self):
+        return ingest(self.db, 'current', self.reports)
+
+    def test_v2_realistic_77_and_repeat_preserves_decisions(self):
+        text = json.dumps(payload(), ensure_ascii=False)
+        mid = self.add('user', text)
+        self.add('user', json.dumps(payload(1)), session='other')
+        result = self.run_ingest()
+        self.assertEqual((result['total'], result['modules'], result['messageIDs']), (77, 1, [mid]))
+        state = Path(result['statePath'])
+        data = json.loads(state.read_text())
+        data['decisions'] = {'1': {'status': 'skipped', 'history': [{'status': 'agreed'}]}}
+        state.write_text(json.dumps(data))
+        before = {p.name: p.read_bytes() for p in self.reports.iterdir()}
+        self.assertEqual(self.run_ingest(), result)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.reports.iterdir()})
+
+    def test_v2_session_binding_running_only_unique(self):
+        def call(status, session='current'):
+            self.add('assistant', part={'type': 'tool', 'id': 'tool-self', 'name': 'bash',
+                     'state': {'input': {'command': 'python scripts/sonar_ingest.py --call-id ' + TOKEN}}}, session=session, status=status)
+        with self.assertRaises(IntakeError):
+            current_session(self.db, TOKEN)
+        call('running')
+        self.assertEqual(current_session(self.db, TOKEN), 'current')
+        call('completed', 'other')
+        with self.assertRaises(IntakeError):
+            current_session(self.db, TOKEN)
+
+    def test_v2_invalid_last_message_no_old_fallback(self):
+        self.add('user', json.dumps(payload()))
+        self.add('user', '{"issues":')
+        with self.assertRaises(IntakeError):
+            self.run_ingest()
+        self.assertFalse(self.reports.exists())
+        self.add('user', json.dumps(payload()))
+        self.assertEqual(self.run_ingest()['status'], 'READY')
+
+    def test_v2_other_session_has_no_source(self):
+        self.add('user', json.dumps(payload()), session='other')
+        with self.assertRaises(IntakeError):
+            ingest(self.db, 'other', self.reports)
+
+    def test_v2_new_url_requires_new_handoff(self):
+        self.add('user', URL.replace('4242', '4243'))
+        self.add('user', json.dumps(payload()))
+        with self.assertRaises(IntakeError):
+            self.run_ingest()
+
+    def test_v2_main_single_compact_response(self):
+        self.add('user', json.dumps(payload()))
+        self.add('assistant', part={'type': 'tool', 'id': 'tool-self', 'name': 'bash',
+                 'state': {'input': {'command': 'python scripts/sonar_ingest.py --call-id ' + TOKEN}}}, status='running')
+        out = io.StringIO()
+        with patch.object(sonar_ingest, 'database_path', return_value=self.root / 'opencode.db'), \
+             patch.object(sonar_ingest.Path, 'home', return_value=self.root), \
+             patch('sys.argv', ['sonar_ingest.py', '--call-id', TOKEN]), contextlib.redirect_stdout(out):
+            self.assertEqual(sonar_ingest.main(), 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual((result['status'], result['total']), ('READY', 77))
+        self.assertNotIn('Проверка', out.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main()

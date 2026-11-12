@@ -33,38 +33,120 @@ def database_path():
     return path
 
 
+V2_SCHEMA = {'id', 'session_id', 'data', 'time_created'}
+V1_SCHEMA = {'session': {'id', 'directory'},
+             'message': {'id', 'session_id', 'data', 'time_created'},
+             'part': {'id', 'message_id', 'session_id', 'data', 'time_created'}}
+
+
+def table_columns(db, table):
+    return {row[1] for row in db.execute('PRAGMA table_info(' + table + ')')}
+
+
+def storage_kind(db):
+    # OpenCode 2 пишет сессии в session_message; OpenCode 1.x — в message/part.
+    # Таблицы legacy остаются в базе после перехода, но новые записи не получают.
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'session_message' in tables and V2_SCHEMA <= table_columns(db, 'session_message'):
+        return 'v2'
+    if all(table in tables and required <= table_columns(db, table) for table, required in V1_SCHEMA.items()):
+        return 'v1'
+    raise IntakeError('Формат локальной базы OpenCode изменился; автоматический приём остановлен.')
+
+
 @contextmanager
 def connect(path):
     db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=10)
     try:
         db.execute('PRAGMA query_only=ON')
-        for table, columns in {'session': {'id', 'directory'}, 'message': {'id', 'session_id', 'data', 'time_created'},
-                               'part': {'id', 'message_id', 'session_id', 'data', 'time_created'}}.items():
-            actual = {row[1] for row in db.execute('PRAGMA table_info(' + table + ')')}
-            require(columns <= actual, 'Формат локальной базы OpenCode изменился; автоматический приём остановлен.')
+        storage_kind(db)
         yield db
     finally:
         db.close()
 
 
+def _tool_command(state):
+    input_data = state.get('input')
+    return input_data.get('command', '') if isinstance(input_data, dict) else ''
+
+
 def current_session(db, call_id):
     require(re.fullmatch(r'[a-f0-9]{24,64}', call_id) is not None, 'Нужна новая уникальная метка --call-id: 24–64 шестнадцатеричных символа.')
-    matches = []
     # Ищем только вызов инструмента с этой меткой. Не выбираем сессию по времени.
-    for sid, raw in db.execute("SELECT session_id,data FROM part WHERE json_extract(data,'$.type')='tool' AND data LIKE ?", ('%' + call_id + '%',)):
-        part = json.loads(raw)
-        state = part.get('state', {})
-        command = state.get('input', {}).get('command', '')
-        if re.search(r'--call-id\s+[\"\']?' + re.escape(call_id) + r'(?=[\s\"\']|$)', command) and 'sonar_ingest.py' in command:
-            matches.append((sid, state.get('status')))
+    pattern = re.compile(r'--call-id\s+[\"\']?' + re.escape(call_id) + r'(?=[\s\"\']|$)')
+    matches = []
+    if storage_kind(db) == 'v2':
+        for sid, raw in db.execute('SELECT session_id,data FROM session_message WHERE data LIKE ?', ('%' + call_id + '%',)):
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                continue
+            content = message.get('content')
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not (isinstance(part, dict) and part.get('type') == 'tool'):
+                    continue
+                state = part.get('state') or {}
+                command = _tool_command(state) if isinstance(state, dict) else ''
+                if pattern.search(command) and 'sonar_ingest.py' in command:
+                    matches.append((sid, state.get('status')))
+    else:
+        for sid, raw in db.execute("SELECT session_id,data FROM part WHERE json_extract(data,'$.type')='tool' AND data LIKE ?", ('%' + call_id + '%',)):
+            part = json.loads(raw)
+            state = part.get('state', {})
+            command = _tool_command(state)
+            if pattern.search(command) and 'sonar_ingest.py' in command:
+                matches.append((sid, state.get('status')))
     require(len(matches) == 1 and matches[0][1] == 'running',
             'Не удалось однозначно связать команду с текущей сессией OpenCode. Приём остановлен; не выбирайте другую сессию и не ищите файлы.')
     return matches[0][0]
 
 
+def _tool_output_text(content):
+    # OpenCode 2 хранит вывод инструмента в state.content — массиве
+    # объектов {type: "text", text: "..."}; извлекаем из него текст.
+    if isinstance(content, list):
+        return '\n'.join(p.get('text', '') for p in content
+                         if isinstance(p, dict) and p.get('type') == 'text' and isinstance(p.get('text'), str))
+    return content if isinstance(content, str) else ''
+
+
+def _norm_part(part):
+    # OpenCode 2 хранит вывод инструмента в state.content вместо state.output.
+    if part.get('type') == 'tool' and isinstance(part.get('state'), dict):
+        state = part['state']
+        if 'output' not in state and 'content' in state:
+            part = dict(part)
+            state = dict(state)
+            state['output'] = _tool_output_text(state.get('content'))
+            part['state'] = state
+    return part
+
+
+def _session_exists(db, session_id):
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table in ('session', 'session_v2'):
+        if table in tables and db.execute('SELECT 1 FROM ' + table + ' WHERE id=?', (session_id,)).fetchone():
+            return True
+    return False
+
+
 def history(db, session_id):
-    require(db.execute('SELECT 1 FROM session WHERE id=?', (session_id,)).fetchone(), 'Сессия OpenCode не найдена.')
+    require(_session_exists(db, session_id), 'Сессия OpenCode не найдена.')
     rows = []
+    if storage_kind(db) == 'v2':
+        order = 'time_created, seq, id' if 'seq' in table_columns(db, 'session_message') else 'time_created, id'
+        for mid, raw in db.execute('SELECT id,data FROM session_message WHERE session_id=? ORDER BY ' + order, (session_id,)):
+            message = json.loads(raw)
+            if 'agent' in message:
+                rows.append({'id': mid, 'role': 'assistant',
+                             'parts': [_norm_part(p) for p in message.get('content') or [] if isinstance(p, dict)]})
+            else:
+                text = message.get('text')
+                rows.append({'id': mid, 'role': 'user',
+                             'parts': [{'type': 'text', 'text': text}] if isinstance(text, str) else []})
+        return rows
     for mid, raw in db.execute('SELECT id,data FROM message WHERE session_id=? ORDER BY time_created,id', (session_id,)):
         message = json.loads(raw)
         parts = [json.loads(row[0]) for row in db.execute('SELECT data FROM part WHERE session_id=? AND message_id=? ORDER BY time_created,id', (session_id, mid))]

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "sonar_state.py"
 INDEX = ROOT / "sonar_index.py"
 SKILL = ROOT.parent / "SKILL.md"
+INGEST = ROOT / "sonar_ingest.py"
 
 
 def run(args):
@@ -329,6 +330,90 @@ def test_generic_markdown_import(tmp):
         fail('Markdown import must not infer business-specific groups from notes')
 
 
+def test_ingest_v2_handoff(tmp):
+    # Полный сценарий V2: api-url → ответ агента → JSON пользователя → ingest → READY.
+    # Вывод инструмента в OpenCode 2 лежит в state.content как массив {type, text}.
+    import sqlite3
+
+    mod = runpy.run_path(str(INGEST))
+    source = "http://sonar.example:9000/project/issues?id=demo&pullRequest=3&resolved=false"
+    api_link = mod["api_url"](source)
+    payload = {
+        "total": 1, "p": 1, "ps": 100,
+        "paging": {"pageIndex": 1, "pageSize": 100, "total": 1},
+        "issues": [{
+            "key": "k1", "rule": "bsl:Typo", "severity": "INFO",
+            "component": "demo:CF/A.bsl", "project": "demo", "pullRequest": "3",
+            "line": 5, "message": "x", "flows": [],
+        }],
+        "components": [
+            {"key": "demo", "qualifier": "TRK", "pullRequest": "3"},
+            {"key": "demo:CF/A.bsl", "qualifier": "FIL", "pullRequest": "3"},
+        ],
+    }
+
+    def make_db(name, *, waiting=True, order_ok=True, api_ok=True):
+        call_id = "ab" * 16
+        db = sqlite3.connect(str(tmp / name))
+        db.execute("CREATE TABLE session (id TEXT)")
+        db.execute("CREATE TABLE session_message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER)")
+        db.execute("INSERT INTO session VALUES ('ses_test')")
+        link = api_link if api_ok else api_link.replace("pullRequest=3", "pullRequest=4")
+        out_text = link + "\nWAITING_FOR_USER_JSON" if waiting else link
+        messages = [
+            ("m1", {"text": source}, 1),
+            ("m2", {"agent": "a", "content": [{"type": "tool", "state": {
+                "input": {"command": 'python scripts/sonar_index.py api-url "' + source + '"'},
+                "status": "completed",
+                "content": [{"type": "text", "text": t} for t in out_text.split("\n")],
+            }}]}, 2 if order_ok else 4),
+            ("m3", {"text": json.dumps(payload, ensure_ascii=False)}, 3 if order_ok else 2),
+            ("m4", {"agent": "a", "content": [{"type": "tool", "state": {
+                "input": {"command": "python scripts/sonar_ingest.py --call-id " + call_id},
+                "status": "running",
+            }}]}, 5),
+        ]
+        for mid, data, created in sorted(messages, key=lambda row: row[2]):
+            db.execute("INSERT INTO session_message VALUES (?,?,?,?)",
+                       (mid, "ses_test", json.dumps(data, ensure_ascii=False), created))
+        db.commit()
+        return db, call_id
+
+    def expect_error(db, call_id, fragment):
+        try:
+            sid = mod["current_session"](db, call_id)
+            mod["ingest"](db, sid, str(tmp / ("reports-" + fragment)))
+        except mod["IntakeError"] as exc:
+            if fragment not in str(exc):
+                fail("error mismatch: " + str(exc))
+        else:
+            fail("scenario must be refused: " + fragment)
+
+    db, call_id = make_db("ok.db")
+    sid = mod["current_session"](db, call_id)
+    if sid != "ses_test":
+        fail("current_session returned another session: " + sid)
+    result = mod["ingest"](db, sid, str(tmp / "reports-ok"))
+    if result["status"] != "READY" or result["total"] != 1 or result["received"] != 1:
+        fail("unexpected READY payload: " + json.dumps(result))
+    for field in ("issuesPath", "indexPath", "statePath"):
+        if not Path(result[field]).is_file():
+            fail("missing artifact: " + result[field])
+    db.close()
+
+    db, call_id = make_db("no-waiting.db", waiting=False)
+    expect_error(db, call_id, "не подтверждена выдача API-ссылки")
+    db.close()
+
+    db, call_id = make_db("wrong-order.db", order_ok=False)
+    expect_error(db, call_id, "не подтверждена выдача API-ссылки")
+    db.close()
+
+    db, call_id = make_db("wrong-api.db", api_ok=False)
+    expect_error(db, call_id, "не подтверждена выдача API-ссылки")
+    db.close()
+
+
 def test_skill_contract():
     text = SKILL.read_text(encoding="utf-8")
     required = [
@@ -405,6 +490,7 @@ def main(argv):
         test_resume_and_skipped(tmp)
         test_queue_and_index(tmp)
         test_generic_markdown_import(tmp)
+        test_ingest_v2_handoff(tmp)
     if "--comparison-state" in argv:
         state_path = argv[argv.index("--comparison-state") + 1]
         issues_path = argv[argv.index("--comparison-issues") + 1]
